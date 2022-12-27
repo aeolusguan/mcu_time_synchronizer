@@ -80,7 +80,8 @@ void curi::USB_COM_UTC::USB_In_CBF(struct libusb_transfer *transfer) {
 }
 
 void curi::USB_COM_UTC::USB_Out_CBF(struct libusb_transfer *transfer) {
-
+  if (transfer->status != LIBUSB_TRANSFER_COMPLETED)
+    std::cout << "[Error] Send Failed! Try again!\n";
 }
 
 void curi::USB_COM_UTC::Print_Rx_Data() {
@@ -88,4 +89,28 @@ void curi::USB_COM_UTC::Print_Rx_Data() {
             << " UTC DATA] " << usb_data_drv->real_utc << " [Date] "
             << usb_data_drv->date_utc <<
             "[ST TIME] " << usb_data_drv->st_time << std::endl;
+}
+
+void stm32_tx_cbf_wrapper(struct libusb_transfer *transfer) {
+  auto *temp = reinterpret_cast<curi::USB_COM_UTC *>(transfer->user_data);
+  temp->USB_Out_CBF(transfer);
+}
+
+void curi::USB_COM_UTC::SendCMD(int cmd) {
+  this->Send_Command_2_STM32(cmd, stm32_tx_cbf_wrapper);
+}
+
+void curi::USB_COM_UTC::Send_Command_2_STM32(
+    int cmd,
+    void (*cbf_wrapper)(struct libusb_transfer *)) {
+  for (int i = 0; i < usb_message_32_2_8; i++) {
+    tx_buff[4 * i] = cmd;
+    tx_buff[4 * i + 1] = cmd >> 8;
+    tx_buff[4 * i + 2] = cmd >> 16;
+    tx_buff[4 * i + 3] = cmd >> 24;
+  }
+  libusb_fill_interrupt_transfer(transfer_tx, get_device_handle(), endpoint_out,
+                                 tx_buff, usb_message_out_length, cbf_wrapper,
+                                 this, 0);
+  libusb_submit_transfer(transfer_tx);
 }

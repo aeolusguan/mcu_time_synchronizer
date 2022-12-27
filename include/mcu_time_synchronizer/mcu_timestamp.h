@@ -61,11 +61,10 @@ class TimestampReceiver {
       done_{false} {
     usb_dev_ = std::make_shared<USB_COM_UTC>(
         USB_RX_WORDS_PER_MESSAGE,
-        4, Vendor_id_Hex(vendor_id),
+        USB_TX_WORDS_PER_MESSAGE, Vendor_id_Hex(vendor_id),
         Product_id_Hex(product_id),
-        endpoint_1, 0x00);
+        endpoint_1, endpoint_2);
 
-    scoped_m lock(mutex_);
     worker_ = std::make_shared<std::thread>([this] { run(); });
   }
 
@@ -76,8 +75,8 @@ class TimestampReceiver {
   }
 
   // prohibit copy
-  TimestampReceiver(const TimestampReceiver&) = delete;
-  TimestampReceiver& operator=(const TimestampReceiver&) = delete;
+  TimestampReceiver(const TimestampReceiver &) = delete;
+  TimestampReceiver &operator=(const TimestampReceiver &) = delete;
 
   /// Not thread safe
   void reset(const uint16_t vendor_id,
@@ -90,9 +89,9 @@ class TimestampReceiver {
 
     usb_dev_ = std::make_shared<USB_COM_UTC>(
         USB_RX_WORDS_PER_MESSAGE,
-        4, Vendor_id_Hex(vendor_id),
+        USB_TX_WORDS_PER_MESSAGE, Vendor_id_Hex(vendor_id),
         Product_id_Hex(product_id),
-        endpoint_1, 0x00);
+        endpoint_1, endpoint_2);
     verbose_ = verbose;
     done_ = false;
     worker_ = std::make_shared<std::thread>([this] { run(); });
@@ -112,9 +111,13 @@ class TimestampReceiver {
     return true;
   }
 
+  void sendCMD(int cmd) { usb_dev_->SendCMD(cmd); }
+
  public:
   static const unsigned char endpoint_1 = 0x81;
+  static const unsigned char endpoint_2 = 0x01;
   static const int USB_RX_WORDS_PER_MESSAGE = 20;
+  static const int USB_TX_WORDS_PER_MESSAGE = 4;
   static const int MAX_QUEUE_SIZE = 1000;
 
  private:
@@ -166,7 +169,9 @@ class TimestampReceiver {
 };
 
 const unsigned char TimestampReceiver::endpoint_1;
+const unsigned char TimestampReceiver::endpoint_2;
 const int TimestampReceiver::USB_RX_WORDS_PER_MESSAGE;
+const int TimestampReceiver::USB_TX_WORDS_PER_MESSAGE;
 const int TimestampReceiver::MAX_QUEUE_SIZE;
 
 /// Convert a NMEA RMC date and time to UNIX epoch time.

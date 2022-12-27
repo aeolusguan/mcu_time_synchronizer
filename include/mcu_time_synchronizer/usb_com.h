@@ -48,7 +48,11 @@ class USB_COM_UTC : public curi::USB_COM {
     return usb_data_drv;
   }
 
+  void SendCMD(int cmd);
+
  private:
+  void Send_Command_2_STM32(int cmd, void (*cbf_wrapper)(struct libusb_transfer *));
+
   uint64_t frame_id;
   usb_utc_rx_cmd_t *usb_in_data;
   usb_utc_rx_data_t *usb_data_drv;

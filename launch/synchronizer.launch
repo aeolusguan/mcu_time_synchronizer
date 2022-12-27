@@ -2,8 +2,10 @@
   <!-- MCU synchronizer param -->
   <arg name="vendor_id"             default="0xabcd"/>
   <arg name="product_id"            default="0x1234"/>
-  <arg name="cam_tm_topic_name"     default="/camera"/>
-  <arg name="cam_offset_topic_name" default="/mcu_master_camera_offset"/>
+  <arg name="cam_tm_topic_name"     default="camera"/>
+  <arg name="cam_offset_topic_name" default="mcu_master_camera_offset"/>
+  <arg name="imu_tm_topic_name"     default="imu/data"/>
+  <arg name="imu_offset_topic_name" default="mcu_master_imu_offset"/>
 
   <node pkg="mcu_time_synchronizer" type="mcu_time_synchronizer_node" output="screen" name="mcu_synchronizer_node">
 
@@ -12,6 +14,8 @@
     <param name="product_id"            value="$(arg product_id)" />
     <param name="cam_tm_topic_name"     value="$(arg cam_tm_topic_name)"/>
     <param name="cam_offset_topic_name" value="$(arg cam_offset_topic_name)"/>
+    <param name="imu_tm_topic_name"     value="$(arg imu_tm_topic_name)"/>
+    <param name="imu_offset_topic_name" value="$(arg imu_offset_topic_name)"/>
   </node>
 
 </launch>

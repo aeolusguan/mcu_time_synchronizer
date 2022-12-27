@@ -4,6 +4,7 @@
 #include <termios.h>
 #include <ros/ros.h>
 #include <std_msgs/Float64.h>
+#include <sensor_msgs/Imu.h>
 #include <boost/accumulators/accumulators.hpp>
 #include <boost/accumulators/statistics/stats.hpp>
 #include <boost/accumulators/statistics/variance.hpp>
@@ -40,37 +41,59 @@ int getch(void) {
 class Synchronizer {
   using scoped_m = std::unique_lock<std::mutex>;
 
-  std::vector<double> tm_cam_utc_;
-  std::vector<double> tm_cam_hw_;
+  std::vector<double> tm_utc_;
+  std::vector<double> tm_hw_;
 
+  ros::NodeHandle nh_;
   ros::NodeHandle nh_pvt_;
+  std::string imu_topic_name_;
+  std::string cam_topic_name_;
   ros::Subscriber cam_subscriber_object_;
+  ros::Subscriber imu_subscriber_object_;
   ros::Publisher cam_pub_object_;
+  ros::Publisher imu_pub_object_;
   curi::TimestampReceiver recv_;
   std::shared_ptr<std::thread> worker_;
+  std::shared_ptr<std::thread> key_worker_;
   std::mutex mutex_;
   std::atomic_bool done_;
+  std::atomic_bool key_done_;
+  std::mutex key_mutex_;
+  std::condition_variable key_cond_;
+  bool key_press_;
+  int key_;
 
  public:
   Synchronizer()
-      : tm_cam_hw_{},
-        tm_cam_utc_{},
+      : tm_hw_{},
+        tm_utc_{},
+        nh_{},
         nh_pvt_{"~"},
         done_{false},
-        mutex_{} {
-    std::string cam_topic_name;
-    ROS_FATAL_COND(!nh_pvt_.getParam("cam_tm_topic_name", cam_topic_name),
+        key_done_{false},
+        mutex_{},
+        key_mutex_{},
+        key_cond_{},
+        key_press_{false},
+        cam_topic_name_{"camera"},
+        imu_topic_name_{"imu/data"} {
+    ROS_FATAL_COND(!nh_pvt_.getParam("cam_tm_topic_name", cam_topic_name_),
                    "\"cam_tm_topic_name\" is not specified");
-    cam_subscriber_object_ = nh_pvt_.subscribe(cam_topic_name,
-                                               1000,
-                                               &Synchronizer::camTimestampCallback,
-                                               this);
+    ROS_FATAL_COND(!nh_pvt_.getParam("imu_tm_topic_name", imu_topic_name_),
+                   "\"imu_tm_topic_name\" is not specified");
+
     std::string cam_offset_topic_name;
     ROS_FATAL_COND(!nh_pvt_.getParam("cam_offset_topic_name",
                                      cam_offset_topic_name),
                    "\"cam_offset_topic_name\" is not specified");
     cam_pub_object_ =
-        nh_pvt_.advertise<std_msgs::Float64>(cam_offset_topic_name, 1000);
+        nh_.advertise<std_msgs::Float64>(cam_offset_topic_name, 1000);
+    std::string imu_offset_topic_name;
+    ROS_FATAL_COND(!nh_pvt_.getParam("imu_offset_topic_name",
+                                     imu_offset_topic_name),
+                   "\"imu_offset_topic_name\" is not specified");
+    imu_pub_object_ =
+        nh_.advertise<std_msgs::Float64>(imu_offset_topic_name, 1000);
     std::string vendor_id, product_id;
     ROS_FATAL_COND(!nh_pvt_.getParam("vendor_id", vendor_id),
                    "\"vendor_id\" of usb device is not specified");
@@ -79,58 +102,75 @@ class Synchronizer {
     recv_.reset((uint16_t) stoi(vendor_id, nullptr, 16),
                 (uint16_t) stoi(product_id, nullptr, 16),
                 false);
+    key_worker_ = std::make_shared<std::thread>([this] { keyLoop(); });
     worker_ = std::make_shared<std::thread>([this] { run(); });
   }
 
   ~Synchronizer() {
+    key_done_ = true;
+    if (key_worker_->joinable())
+      key_worker_->join();
     done_ = true;
     if (worker_->joinable())
       worker_->join();
   }
 
  private:
-  void add_utc_time(double tm) { tm_cam_utc_.push_back(tm); }
+  void add_utc_time(double tm) { tm_utc_.push_back(tm); }
 
   void clear() {
-    tm_cam_utc_.clear();
-    scoped_m lk;
-    tm_cam_hw_.clear();
+    tm_utc_.clear();
+    scoped_m lk(mutex_);
+    tm_hw_.clear();
   }
 
   void camTimestampCallback(const spinnaker_sdk_camera_driver::SpinnakerImageNames &msg) {
     double tm = msg.header.stamp.toSec() - msg.time.toSec();
-    scoped_m lk;
-    tm_cam_hw_.push_back(tm);
+    scoped_m lk(mutex_);
+    tm_hw_.push_back(tm);
+  }
+
+  void imuTimestampCallback(const sensor_msgs::Imu::ConstPtr &imu_data) {
+    /// 3.19 ms: time difference between trigger and first inertial data available
+    double tm = imu_data->header.stamp.toSec() - 0.00319;
+    scoped_m lk(mutex_);
+    bool valid = tm_hw_.empty();
+    if (!valid)
+      valid = (tm - tm_hw_.back()) > 0.015;
+    if (valid)
+      tm_hw_.push_back(tm);
   }
 
   bool Execute(double &offset) {
     using namespace boost::accumulators;
-    if (tm_cam_utc_.size() < 5) {
+    if (tm_utc_.size() < 5) {
       ROS_WARN("number of UTC timestamp is not enough, at least 5 is required!");
       return false;
     }
-    scoped_m lk;
-    if (tm_cam_utc_.size() != tm_cam_hw_.size()) {
+    scoped_m lk(mutex_);
+    if (tm_utc_.size() != tm_hw_.size()) {
       ROS_WARN("number of timestamps mismatch: %lu (utc) vs %lu (hw)",
-               tm_cam_utc_.size(), tm_cam_hw_.size());
+               tm_utc_.size(), tm_hw_.size());
       return false;
     }
 
     ROS_INFO("offset list:");
     accumulator_set<double, stats<tag::variance(lazy)>> acc;
-    for (int i = 0; i < tm_cam_utc_.size(); ++i) {
-      double tmp = tm_cam_utc_[i] - tm_cam_hw_[i];
+    for (int i = 0; i < tm_utc_.size(); ++i) {
+      double tmp = tm_utc_[i] - tm_hw_[i];
       acc(tmp);
       printf("\t%.6lf\n", tmp);
     }
-    double std_dev = sqrt(variance(acc)) * 1e6;
+    double std_dev = sqrt(variance(acc));
     ROS_INFO(
-        "standard deviation: %lf us, please press 'y' or 'Y' if you accept "
-        "this result, otherwise to calibrate again",
+        "standard deviation: %.6f s, please press 'y' or 'Y' if you accept "
+        "this result, otherwise (except 'C', 'c', 'I', 'i') to calibrate again",
         std_dev);
-    int ch = getch();
-    if ((ch == 'Y') || (ch == 'y')) {
-      offset = tm_cam_utc_.back() - tm_cam_hw_.back();
+    scoped_m lk2(key_mutex_);
+    key_cond_.wait(lk2, [this] { return key_press_; });
+    key_press_ = false;
+    if ((key_ == 'Y') || (key_ == 'y')) {
+      offset = tm_utc_.back() - tm_hw_.back();
       return true;
     }
     return false;
@@ -138,26 +178,27 @@ class Synchronizer {
 
   bool sync(double offset_old, double &offset_new) {
     scoped_m lk;
-    double latest_utc = tm_cam_utc_.back();
-    if (tm_cam_hw_.empty()) return false;
-    int idx = tm_cam_hw_.size();
-    for (auto it = tm_cam_hw_.rbegin(); it != tm_cam_hw_.rend(); ++it) {
+    if (tm_hw_.empty() || tm_utc_.empty()) return false;
+
+    double latest_utc = tm_utc_.back();
+    int idx = tm_hw_.size();
+    for (auto it = tm_hw_.rbegin(); it != tm_hw_.rend(); ++it) {
       if (abs(*it + offset_old - latest_utc) < 1e-3) {
         offset_new = latest_utc - *it;
-        tm_cam_hw_.erase(tm_cam_hw_.begin(), tm_cam_hw_.begin() + idx);
-        tm_cam_utc_.clear();
+        tm_hw_.erase(tm_hw_.begin(), tm_hw_.begin() + idx);
+        tm_utc_.clear();
         return true;
       }
       idx--;
     }
 
-    double latest_hw = tm_cam_hw_.back();
-    idx = tm_cam_utc_.size();
-    for (auto it = tm_cam_utc_.rbegin(); it != tm_cam_utc_.rend(); ++it) {
+    double latest_hw = tm_hw_.back();
+    idx = tm_utc_.size();
+    for (auto it = tm_utc_.rbegin(); it != tm_utc_.rend(); ++it) {
       if (abs(*it - latest_hw - offset_old) < 1e-3) {
         offset_new = *it - latest_hw;
-        tm_cam_utc_.erase(tm_cam_utc_.begin(), tm_cam_utc_.begin() + idx);
-        tm_cam_hw_.clear();
+        tm_utc_.erase(tm_utc_.begin(), tm_utc_.begin() + idx);
+        tm_hw_.clear();
         return true;
       }
       idx--;
@@ -166,23 +207,29 @@ class Synchronizer {
     return false;
   }
 
-  void run() {
+  double calibrate(const char *tag) {
     bool ok = false;
     curi::usb_utc_rx_data_t timestamp;
     time_t unix_secs;
     int nano_secs;
     double offset = 0.;
+    const char *keys = nullptr;
+    if (strcmp(tag, "imu") == 0)
+      keys = "'I' or 'i'";
+    else
+      keys = "'C' or 'c'";
     while (!ok) {
       clear();
       ROS_INFO(
-          "Please press the user key to calibrate clock offset between MCU and camera. "
-          "You are suggested to press the keys 5-10 times to trigger the camera. "
-          "Note: the time interval between press action must not be larger than 15 seconds, "
-          "otherwise the key press process are regarded as finished and begin to calculate offset.");
+          "Please press %s to calibrate clock offset between MCU and %s. "
+          "You are suggested to press the keys 5-10 times to trigger the %s. "
+          "Note: the time interval between press action must not be larger than 10 seconds, "
+          "otherwise the key press process are regarded as finished and begin to calculate offset.",
+          keys, tag, tag);
       bool start = false;
       bool done = false;
       while (!done) {
-        bool received = recv_.retrieveTimestamp(timestamp, start, 15000);
+        bool received = recv_.retrieveTimestamp(timestamp, start, 10000);
         if (received) {
           start = true;
           if (curi::mcu_sync(&timestamp)) {
@@ -195,24 +242,52 @@ class Synchronizer {
         }
         done = !received;
       }
-
-      // calculate the clock offset between mcu and camera
+      // calculate the clock offset between mcu and sensor
       ok = Execute(offset);
     }
+    return offset;
+  }
 
-    ROS_INFO("Finish clock offset initial calibration");
+  void run() {
+    /// calibrate IMU and MCU clock offset
+    imu_subscriber_object_ = nh_.subscribe(imu_topic_name_,
+                                           1000,
+                                           &Synchronizer::imuTimestampCallback,
+                                           this);
+    double imu_offset = calibrate("imu");
+    std_msgs::Float64 imu_offset_pub;
+    imu_offset_pub.data = imu_offset;
+    imu_pub_object_.publish(imu_offset_pub);
+    imu_subscriber_object_.shutdown();
     clear();
+    ROS_INFO("Finish IMU clock offset calibration");
 
+    /// calibrate camera and MCU clock offset
+    cam_subscriber_object_ = nh_.subscribe(cam_topic_name_,
+                                           1000,
+                                           &Synchronizer::camTimestampCallback,
+                                           this);
+    double cam_offset = calibrate("camera");
+    ROS_INFO("Finish camera clock offset initial calibration");
+
+    /// finish key event handler and enable camera auto trigger
+    key_done_ = true;
+    recv_.sendCMD(2);
+
+    /// continuously update the clock offset between camera and MCU
+    std_msgs::Float64 cam_offset_pub;
     ros::Time last_offset_time = ros::Time::now();
-    std_msgs::Float64 offset_pub;
-    double offset_new = offset;
+    double cam_offset_new = cam_offset;
     while (!done_) {
       if ((ros::Time::now() - last_offset_time).toSec() > 60) {
         last_offset_time = ros::Time::now();
-        ROS_INFO("Camera-MCU clock offset: %.6lf", offset);
+        ROS_INFO("Camera-MCU clock offset: %.6lf", cam_offset);
       }
 
       // receive new timestamp from MCU
+      curi::usb_utc_rx_data_t timestamp;
+      time_t unix_secs;
+      int nano_secs;
       if (recv_.retrieveTimestamp(timestamp, true, 1000)) {
         if (curi::mcu_sync(&timestamp)) {
           curi::parse_mcu_time(&timestamp, &unix_secs, &nano_secs);
@@ -221,11 +296,29 @@ class Synchronizer {
         } else {
           add_utc_time(timestamp.st_time);
         }
-        if (sync(offset, offset_new)) {
-          offset = offset_new;
-          offset_pub.data = offset;
-          cam_pub_object_.publish(offset_pub);
+        if (sync(cam_offset, cam_offset_new)) {
+          cam_offset = cam_offset_new;
+          cam_offset_pub.data = cam_offset;
+          cam_pub_object_.publish(cam_offset_pub);
         }
+      }
+    } // while (!done_)
+  }
+
+  void keyLoop() {
+    while (!key_done_) {
+      int ch = getch();
+      if (ch == 'C' || ch == 'c') {  // trigger camera
+        std::cout << "send 1" << std::endl;
+        recv_.sendCMD(1);
+      } else if (ch == 'I' || ch == 'i') {  // trigger IMU
+        recv_.sendCMD(0);
+      } else {  // forward key event
+        scoped_m lk(key_mutex_);
+        key_press_ = true;
+        key_ = ch;
+        lk.unlock();
+        key_cond_.notify_all();
       }
     }
   }
