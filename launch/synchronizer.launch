@@ -3,7 +3,7 @@
   <arg name="vendor_id"             default="0xabcd"/>
   <arg name="product_id"            default="0x1234"/>
   <arg name="cam_tm_topic_name"     default="camera"/>
-  <arg name="cam_offset_topic_name" default="mcu_master_camera_offset"/>
+  <arg name="cam_offset_topic_name" default="/mcu_master_camera_offset"/>
   <arg name="imu_tm_topic_name"     default="imu/data"/>
   <arg name="imu_offset_topic_name" default="mcu_master_imu_offset"/>
 

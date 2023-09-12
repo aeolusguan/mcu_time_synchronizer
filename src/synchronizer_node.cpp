@@ -268,6 +268,12 @@ class Synchronizer {
                                            &Synchronizer::camTimestampCallback,
                                            this);
     double cam_offset = calibrate("camera");
+    std_msgs::Float64 cam_offset_pub;
+    cam_offset_pub.data = cam_offset;
+    cam_pub_object_.publish(cam_offset_pub);
+    cam_pub_object_.publish(cam_offset_pub);
+    cam_pub_object_.shutdown();
+    clear();
     ROS_INFO("Finish camera clock offset initial calibration");
 
     /// finish key event handler and enable camera auto trigger
@@ -275,8 +281,8 @@ class Synchronizer {
     recv_.sendCMD(2);
 
     /// continuously update the clock offset between camera and MCU
-    std_msgs::Float64 cam_offset_pub;
-    ros::Time last_offset_time = ros::Time::now();
+    
+    /*ros::Time last_offset_time = ros::Time::now();
     double cam_offset_new = cam_offset;
     while (!done_) {
       if ((ros::Time::now() - last_offset_time).toSec() > 60) {
@@ -299,17 +305,18 @@ class Synchronizer {
         if (sync(cam_offset, cam_offset_new)) {
           cam_offset = cam_offset_new;
           cam_offset_pub.data = cam_offset;
-          cam_pub_object_.publish(cam_offset_pub);
+          //cam_pub_object_.publish(cam_offset_pub);
+          std::cout << "sync" << std::endl;
         }
+        std::cout << "received new timestamp" << std::endl;
       }
-    } // while (!done_)
+    } // while (!done_)*/
   }
 
   void keyLoop() {
     while (!key_done_) {
       int ch = getch();
       if (ch == 'C' || ch == 'c') {  // trigger camera
-        std::cout << "send 1" << std::endl;
         recv_.sendCMD(1);
       } else if (ch == 'I' || ch == 'i') {  // trigger IMU
         recv_.sendCMD(0);
